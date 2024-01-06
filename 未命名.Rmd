@@ -1,0 +1,348 @@
+---
+title: "食管鳞状细胞癌单细胞转录组数据分析"
+author: "23111220147 朱宁骐"
+output:
+  rticles::ctex:
+documentclass: ctexart
+date: "2024-01-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1、数据读取、质控及降维
+
+首先载入所需要的程序包
+
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(patchwork)
+library(stringr)
+library(SingleR)
+library(celldex)
+library(ggplot2)
+library(cowplot)
+library(DESeq2)
+library(fgsea)
+```
+
+读取给定的数据于cell_data中
+
+```{r message=FALSE, warning=FALSE}
+cell_data = readRDS("/Users/xiaoningning/Desktop/final_project/CD45+.rds")
+```
+
+创建一个seurat对象（筛选至少在0.1%的细胞（约30个）中表达的基因（根据原文），筛选至少有200个基因表达的细胞）
+
+```{r message=FALSE, warning=FALSE}
+cells = CreateSeuratObject(counts = cell_data, project = "CD45+", min.cells = 30, min.features = 200)
+```
+
+添加分组信息，分为T（肿瘤组）和N（正常组）,以及样本信息，并根据不同样本（17个样本）分为17个layer（Seurat V5新功能）
+
+```{r message=FALSE, warning=FALSE}
+groups <- sample("", size = 29129, replace = TRUE)
+names(groups) <- colnames(cells)
+for (i in c(1:length(groups))) {
+  groups[i] = str_extract(names(groups)[i], "(?<=\\d).(?=-)")
+}
+samples <- sample("", size = 29129, replace = TRUE)
+names(samples) <- colnames(cells)
+for (i in c(1:length(samples))) {
+  samples[i] = str_extract(names(samples)[i], ".*(?=-)")
+}
+cells <- AddMetaData(object = cells, metadata = groups, col.name = "group")
+cells <- AddMetaData(object = cells, metadata = samples, col.name = "sample")
+cells[["RNA"]] <- split(cells[["RNA"]], f = cells$sample)
+```
+
+添加线粒体基因比例的列
+
+```{r message=FALSE, warning=FALSE}
+cells[["percent.mt"]] <- PercentageFeatureSet(cells, pattern = "^MT-")
+```
+
+绘制质控指标小提琴图
+
+```{r message=FALSE, warning=FALSE}
+VlnPlot(cells, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),ncol = 3)
+```
+
+绘制线粒体比例以及基因数量与mRNA数量的关系图
+
+```{r message=FALSE, warning=FALSE}
+FeatureScatter(cells, feature1 = "nCount_RNA", feature2 = "percent.mt")
+```
+```{r message=FALSE, warning=FALSE}
+FeatureScatter(cells, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+```
+
+
+根据原文的筛选方法过滤基因数量小于500及线粒体RNA比例大于20%的细胞
+
+```{r message=FALSE, warning=FALSE}
+cells <- subset(cells, subset = nFeature_RNA >= 500 & percent.mt <= 20)
+```
+
+进行数据的标准化、降维及整合去批次化
+
+```{r message=FALSE, warning=FALSE}
+#数据标准化
+cells <- NormalizeData(cells)
+#寻找高可变基因
+cells <- FindVariableFeatures(cells)
+#将高可变基因在细胞间的表达缩放到均值为0，方差为1，为PCA做准备
+cells <- ScaleData(cells)
+#进行主成分分析
+cells <- RunPCA(cells)
+#采用Seurat官网示例的CCA方法整合去批次化
+cells <- IntegrateLayers(object = cells, method = CCAIntegration, orig.reduction = "pca", new.reduction = "integrated.cca",
+                        verbose = FALSE)
+cells[["RNA"]] <- JoinLayers(cells[["RNA"]])
+```
+
+##2、细胞的分簇
+
+细胞聚类
+
+```{r message=FALSE, warning=FALSE}
+#基于PCA空间（top 10 PCA），计算各细胞间的欧氏距离，挑选每个细胞最近的k个邻居细胞，采用FindNeighbors函数,根据原文，k值设为30。
+cells <- FindNeighbors(cells, dims = 1:10, k.param = 30)
+#边的权重，被定义为共享的邻居细胞的数量。根据设定的resolution进行簇的划分，采用FindClusters函数,根据原文，res值设为0.6。
+cells <- FindClusters(cells, resolution = 0.6)
+```
+
+进行非线性降维（UMAP和tSNE）及其可视化
+
+```{r message=FALSE, warning=FALSE}
+#运行UMAP降维
+cells <- RunUMAP(cells, dims = 1:10)
+#根据不同样本分组的UMAP聚类图，下图可以看出整合去批次效果较好
+DimPlot(cells, reduction = "umap", group.by = "sample")
+```
+
+```{r message=FALSE, warning=FALSE}
+#运行tSNE降维
+cells <- RunTSNE(cells, dims = 1:10)
+#根据不同样本分组的tSNE聚类图，下图可以看出整合去批次效果较好
+DimPlot(cells, reduction = "tsne", group.by = "sample")
+```
+
+根据seurat_clusters的聚类图
+
+```{r message=FALSE, warning=FALSE}
+DimPlot(cells, reduction = "umap", group.by = "seurat_clusters")
+```
+
+```{r message=FALSE, warning=FALSE}
+DimPlot(cells, reduction = "tsne", group.by = "seurat_clusters")
+```
+##3、细胞注释
+
+3.1 使用原文中提供的marker进行注释
+
+```{r message=FALSE, warning=FALSE}
+#T cell
+VlnPlot(cells,features = c("CD2", "CD3D", "CD3E", "CD3G"), layer = "counts",log = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+FeaturePlot(cells, features = c("CD2", "CD3D", "CD3E", "CD3G"))
+```
+
+以上图片可以看出0、1、3、4、7、8、9群细胞高表达T细胞markers
+
+
+
+```{r message=FALSE, warning=FALSE}
+#B cell
+VlnPlot(cells,features = c("CD19", "CD79A", "MS4A1", "JCHAIN", "MZB1"), layer = "counts",log = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+FeaturePlot(cells, features = c("CD19", "CD79A", "MS4A1", "JCHAIN", "MZB1"))
+```
+
+以上图片可以看出5、6、13、16群细胞高表达B细胞markers
+
+
+```{r message=FALSE, warning=FALSE}
+#Myeloid cell
+VlnPlot(cells,features = c("CD68", "LYZ", "CD14", "IL3RA", "LAMP3", "CLEC4C", "TPSAB1"), layer = "counts",log = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+FeaturePlot(cells, features = c("CD68", "LYZ", "CD14", "IL3RA", "LAMP3", "CLEC4C", "TPSAB1"))
+```
+
+可以看出2、10、11、12、14、15群高表达Myeloid细胞基因
+
+
+手动进行细胞注释
+
+下图是umap的细胞分群
+```{r message=FALSE, warning=FALSE}
+new.cluster.ids <- c("T cell", "T cell", "Myeloid cell", "T cell", "T cell", "B cell", "B cell", "T cell","T cell", "T cell", "Myeloid cell", "Myeloid cell", "Myeloid cell", "B cell", "Myeloid cell", "Myeloid cell", "B cell")
+names(new.cluster.ids) <- levels(cells)
+cells <- RenameIdents(cells, new.cluster.ids)
+cells$celltype <- Idents(cells)
+DimPlot(cells, reduction = "umap", label = TRUE, group.by = "celltype")
+```
+
+下图是tsne的细胞分群
+```{r message=FALSE, warning=FALSE}
+DimPlot(cells, reduction = "tsne", label = TRUE, group.by = "celltype")
+```
+
+可以看出根据原文marker以上细胞被分为三群：T cell, B cell, Myeloid cell
+
+3.2 使用SingleR进行自动注释
+
+```{r message=FALSE, warning=FALSE}
+#加载人类基本细胞图谱数据,本方法直接利用HumanPrimaryCellAtlasData()函数从celldex包里获得参考数据，与final_project给出的参考数据一致
+hpca.se <- HumanPrimaryCellAtlasData()
+
+#将seurat对象转换为SingleR分析所需的SingleCellExpriment对象
+cells_singleR <- GetAssayData(cells, assay = "RNA", slot  = "data")
+
+#运行SingleR进行细胞注释
+pred_RNA <- SingleR(test = cells_singleR, ref = hpca.se, labels = hpca.se$label.main)
+
+#将细胞注释信息添加到Seurat对象中
+cells$singleR.labels <- pred_RNA$labels[match(rownames(cells@meta.data), 
+                                                            rownames(pred_RNA))]
+```
+
+基于SingleR的注释进行可视化
+
+下图是umap的细胞分群
+```{r message=FALSE, warning=FALSE}
+DimPlot(cells, reduction = "umap",label = TRUE, label.size = 2, group.by = "singleR.labels")
+```
+下图是tsne的细胞分群
+
+```{r message=FALSE, warning=FALSE}
+DimPlot(cells, reduction = "tsne",label = TRUE, label.size = 2, group.by = "singleR.labels")
+```
+
+3.3 原文作者采用的细胞注释方法
+
+```{r message=FALSE, warning=FALSE}
+#将注释类型文件提取
+origin_annotation <- read.table("/Users/xiaoningning/Desktop/final_project/GSE160269_CD45pos_cells.txt")
+
+#将原文注释文件添加到本Seurat对象上
+original_celltype <- colnames(cells)
+original_celltype <- list(V1 = original_celltype)
+original_celltype$id <- 1:length(original_celltype[[1]])
+original_celltype <- as.data.frame(original_celltype)
+origin_annotation <- as.data.frame(origin_annotation)
+original_celltype <- merge(original_celltype, origin_annotation, by = "V1")
+original_celltype <- original_celltype[order(original_celltype$id), ]
+cells <- AddMetaData(object = cells, metadata = original_celltype$V3, col.name = "original_celltype")
+```
+原注释方法的umap图
+
+```{r message=FALSE, warning=FALSE}
+DimPlot(cells, reduction = "umap",label = TRUE, group.by = "original_celltype")
+```
+
+原注释方法的tsne图
+
+```{r message=FALSE, warning=FALSE}
+DimPlot(cells, reduction = "tsne",label = TRUE, group.by = "original_celltype")
+```
+
+可以看出原注释方法的结果与我根据原文markers手动注释的结果基本一致，与SingleR的注释结果差别较大，SingleR的注释细胞类别更多，更细，但个人认为准确度可能一般。
+
+##4 绘制三种细胞所占比例的柱状图
+
+```{r message=FALSE, warning=FALSE}
+#创建三种细胞在癌和癌旁中个数的表格
+group_table <- as.data.frame(table(cells@meta.data$group,cells@meta.data$original_celltype))
+
+#表头命名
+names(group_table) <- c("group","celltype","CellNumber")
+
+#设置颜色参数
+colour = c("#DC143C","#0000FF","#20B2AA","#FFA500","#9370DB","#98FB98","#F08080","#1E90FF","#7CFC00","#FFFF00",  
+         "#808000","#FF00FF","#FA8072","#7B68EE","#9400D3","#800080","#A0522D","#D2B48C","#D2691E","#87CEEB","#40E0D0","#5F9EA0",
+         "#FF1493","#0000CD","#008B8B","#FFE4B5","#8A2BE2","#228B22","#E9967A","#4682B4","#32CD32","#F0E68C","#FFFFE0","#EE82EE",
+         "#FF6347","#6A5ACD","#9932CC","#8B008B","#8B4513","#DEB887")
+
+#利用ggplot绘图
+plot_group<-ggplot(cells@meta.data,aes(x=group,fill=celltype))+
+  geom_bar(position="fill")+
+  scale_fill_manual(values = colour) + 
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(fill = "transparent",colour = NA),
+        axis.line.x = element_line(colour = "black") ,
+        axis.line.y = element_line(colour = "black") ,
+        plot.title = element_text(lineheight=.8, face="bold", hjust=0.5, size =16)
+  )+labs(y="Percentage")
+plot_group
+```
+
+细胞比例绘图如上，N代表癌旁正常组织，T代表肿瘤组织
+
+## 5 肿瘤和正常组织对应细胞的差异分析
+
+利用pseudobulk矩阵进行基于负二项分布的肿瘤和正常组织的差异分析
+
+```{r message=TRUE, warning=FALSE}
+#首先创建pseudobulk矩阵
+aggregate_cells <- AggregateExpression(cells, group.by = c("original_celltype", "group"), return.seurat = TRUE)
+
+#提取pseudobulk的metadata数据
+pseudo_metadata = as.data.frame(aggregate_cells@meta.data)
+
+#提取pseudobulk的counts数据
+pseudo_counts = GetAssayData(aggregate_cells, assay = "RNA", layer = "counts")
+
+#转化伪单细胞数据为DESeqDataSeq对象
+dds <- DESeqDataSetFromMatrix(countData = pseudo_counts, colData = pseudo_metadata,design = ~group)
+
+#使用 DESeq 函数估计差异
+dds <- DESeq(dds)
+
+#进行差异分析
+res <- results(dds)
+
+#展示前15的部分结果
+head(res, n = 15)
+```
+
+利用Findmarker函数进行差异分析
+
+```{r message=FALSE, warning=FALSE}
+cells$cellType.group <- paste(cells$original_celltype, cells$group, sep = "_")
+Idents(cells) <- "cellType.group"
+T.DE <- FindMarkers(cells, ident.1 = "Tcell_T", ident.2 = "Tcell_N", test.use = 'wilcox', verbose = FALSE)
+B.DE <- FindMarkers(cells, ident.1 = "Bcell_T", ident.2 = "Bcell_N", test.use = 'wilcox', verbose = FALSE)
+M.DE <- FindMarkers(cells, ident.1 = "Myeloid_T", ident.2 = "Myeloid_N", test.use = 'wilcox', verbose = FALSE)
+```
+
+分别查看三种细胞肿瘤和正常组织间前15的差异表达基因
+
+T细胞
+
+```{r message=TRUE, warning=FALSE}
+head(T.DE, n = 15)
+```
+
+B细胞
+
+```{r message=TRUE, warning=FALSE}
+head(B.DE, n = 15)
+```
+
+髓系细胞
+
+```{r message=TRUE, warning=FALSE}
+head(M.DE, n = 15)
+```
+
+
+
+
